@@ -397,6 +397,32 @@ static int rotfs_rename(const char *from, const char *to, unsigned int flags)
 	return 0;
 }
 
+static int rotfs_symlink(const char *target, const char *linkpath)
+{
+    char real_link[PATH_MAX];
+    fullpath(real_link, linkpath);   // backing_root + linkpath
+
+    if (symlink(target, real_link) == -1)
+        return -errno;
+
+    return 0;
+}
+
+static int rotfs_readlink(const char *path, char *buf, size_t size)
+{
+    char real[PATH_MAX];
+    fullpath(real, path);
+
+    ssize_t res = readlink(real, buf, size);
+    if (res == -1)
+        return -errno;
+
+    if ((size_t)res < size)
+        buf[res] = '\0';   // FUSE expects a C-string
+
+    return 0;
+}
+
 static struct fuse_operations rotfs_ops = {
 	.getattr	= rotfs_getattr,
 	.readdir	= rotfs_readdir,
@@ -416,6 +442,8 @@ static struct fuse_operations rotfs_ops = {
 	.listxattr	= rotfs_listxattr,
 	.removexattr	= rotfs_removexattr,
 	.rename		= rotfs_rename,
+	.symlink	= rotfs_symlink,
+	.readlink	= rotfs_readlink,
 };
 
 static int rotfs_opt_proc(void *data, const char *arg, int key,
