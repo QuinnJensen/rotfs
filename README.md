@@ -22,7 +22,7 @@ foo.20260303-210045
 
 ## build and install
 ```bash
-apt-get install libfuse-dev
-make
-cp -p rotfs /usr/local/bin
+$ apt-get install libfuse-dev
+$ make
+$ cp -p rotfs /usr/local/bin
 ```
