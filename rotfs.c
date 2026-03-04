@@ -13,6 +13,7 @@
 #include <time.h>
 #include <limits.h>
 #include <dirent.h>
+#include <sys/xattr.h>
 
 static char *backing_root = NULL;
 
@@ -180,7 +181,7 @@ static int rotfs_truncate(const char *path, off_t size,
 {
 	int res;
 
-	printf(stderr, "TRUNCATE %s size=%11d\n", path, (long long)size);
+	fprintf(stderr, "TRUNCATE %s size=%11lld\n", path, (long long)size);
 
 	if (fi != NULL) {
 		res = ftruncate(fi->fh, size);
@@ -422,6 +423,7 @@ static int rotfs_opt_proc(void *data, const char *arg, int key,
 {
 	(void) data;
 	(void) key;
+	(void) outargs;
 
 	if (strncmp(arg, "--backing=", 10) == 0) {
 		const char *val = arg + 10;
