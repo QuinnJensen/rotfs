@@ -105,6 +105,7 @@ static int rotfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	return 0;
 }
 
+static int promote_ghost(const char *path);
 /*
  * open: if opening for write and (O_TRUNC or O_CREAT without O_EXCL),
  * attempt to back up existing file before creating/truncating.
@@ -113,16 +114,23 @@ static int rotfs_open(const char *path, struct fuse_file_info *fi)
 {
 	int flags = fi->flags;
 	int writeish = (flags & (O_WRONLY | O_RDWR)) != 0;
+	if (!writeish && (flags & O_CREAT)) writeish = 1;
 
 	fprintf(stderr, "OPEN path=%s flags=0x%x\n", path, flags);
 
 	if (writeish) {
-		/* Backup existing file before first write */
+		/* 1. Promote ghost, if this was an unlink-then-recreate case */
+		int r = promote_ghost(path);
+		if (r < 0)
+		    return r;
+
+		/* 2. Normal versioning: if a real file exists, back it up */
 		int res = maybe_backup_existing(path);
 		fprintf(stderr, " backup result: %d\n\n", res);
 		if (res < 0)
 			return res;
 
+		/* 4. Ensure we create a new file when overwriting */
 		flags |= O_CREAT | O_TRUNC;
 	}
 
@@ -140,32 +148,11 @@ static int rotfs_open(const char *path, struct fuse_file_info *fi)
 	return 0;
 }
 
-static int rotfs_create(const char *path, mode_t mode,
-			struct fuse_file_info *fi)
+static int rotfs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
 	fprintf(stderr, "CREATE path=%s flags=0x%x mode=%o\n", path, fi->flags, mode);
 
-	/* Backup if file already exists (O_CREAT without O_EXCL case) */
-	int res = maybe_backup_existing(path);
-	if (res < 0) {
-		fprintf(stderr, "  backup failed: %d\n", res);
-		return res;
-	}
-
-	char real[PATH_MAX];
-	fullpath(real, path);
-
-	int flags = fi->flags | O_CREAT | O_TRUNC;
-
-	fprintf(stderr, "  open(%s, 0x%x, %o)\n", real, flags, mode);
-	int fd = open(real, flags, mode);
-	if (fd == -1) {
-		fprintf(stderr, "  open FAILED: errno=%d\n", errno);
-		return -errno;
-	}
-
-	fi->fh = fd;
-	return 0;
+	return rotfs_open(path, fi);
 }
 
 static int rotfs_read(const char *path, char *buf, size_t size,
@@ -217,12 +204,81 @@ static int rotfs_release(const char *path, struct fuse_file_info *fi)
 
 /* Basic unlink, mkdir, etc., just pass-through; add what you need */
 
+static void make_ghost_name(char *dst, size_t dstsz, const char *real)
+{
+	// real: /backing/foo  -> ghost: /backing/.foo~unlinked
+	const char *base = strrchr(real, '/');
+	const char *name = base ? base + 1 : real;
+	size_t dir_len = base ? (size_t)(base - real + 1) : 0;
+
+	snprintf(dst, dstsz, "%.*s.%s~unlinked",
+			 (int)dir_len, real, name);
+}
+
 static int rotfs_unlink(const char *path)
 {
 	char real[PATH_MAX];
 	fullpath(real, path);
-	if (unlink(real) == -1)
+
+	struct stat st;
+	if (lstat(real, &st) == -1)
 		return -errno;
+
+	if (!S_ISREG(st.st_mode))
+		return -EPERM; /* or passthrough unlink if you prefer */
+
+	char ghost[PATH_MAX];
+	make_ghost_name(ghost, sizeof ghost, real);
+
+	fprintf(stderr, "UNLINK path=%s real=%s ghost=%s\n", path, real, ghost);
+
+	/* Overwrite any existing ghost with the latest contents */
+	if (rename(real, ghost) == -1)
+		return -errno;
+
+	return 0;
+}
+
+static int promote_ghost(const char *path)
+{
+	char real[PATH_MAX];
+	fullpath(real, path);
+
+	// Split dir and name
+	char dir[PATH_MAX], name[PATH_MAX];
+	char *slash = strrchr(real, '/');
+	if (slash) {
+		size_t dlen = (size_t)(slash - real + 1);
+		memcpy(dir, real, dlen);
+		dir[dlen] = '\0';
+		strcpy(name, slash + 1);
+	} else {
+		strcpy(dir, "./");
+		strcpy(name, real);
+	}
+
+	// Ghost name: dir/.name~unlinked
+	char ghost[PATH_MAX];
+	snprintf(ghost, sizeof ghost, "%s.%s~unlinked", dir, name);
+
+	struct stat st;
+	if (lstat(ghost, &st) == -1) {
+		if (errno == ENOENT) {
+			fprintf(stderr, "promote_ghost: no ghost %s\n", ghost);
+			return 0;  // no ghost to promote
+		}
+		fprintf(stderr, "promote_ghost: lstat(%s) failed errno=%d\n", ghost, errno);
+		return -errno;
+	}
+
+	// Visible backup: dir/name-YYYYMMDD-HHMMSS
+	char backup[PATH_MAX];
+	make_backup_name(backup, sizeof backup, real);
+
+	fprintf(stderr, "promote_ghost: %s -> %s\n", ghost, backup);
+	if (rename(ghost, backup) == -1)
+		return -errno;
+
 	return 0;
 }
 
@@ -307,6 +363,39 @@ static int rotfs_removexattr(const char *path, const char *name)
 		return -errno;
 	return 0;
 }
+
+static int rotfs_rename(const char *from, const char *to, unsigned int flags)
+{
+	char real_from[PATH_MAX];
+	char real_to[PATH_MAX];
+
+	fullpath(real_from, from);
+	fullpath(real_to, to);
+
+	fprintf(stderr, "RENAME %s -> %s flags=0x%x\n", from, to, flags);
+
+	/* Handle RENAME_NOREPLACE / RENAME_EXCHANGE if you care about them later;
+	   for now assume flags == 0 (plain mv semantics). */
+
+	struct stat st_to;
+	int dest_exists = (lstat(real_to, &st_to) == 0) && S_ISREG(st_to.st_mode);
+
+	if (dest_exists) {
+		/* Version the existing destination file */
+		char backup_to[PATH_MAX];
+		make_backup_name(backup_to, sizeof backup_to, real_to);
+
+		if (rename(real_to, backup_to) == -1)
+			return -errno;
+	}
+
+	/* Now move source to destination */
+	if (rename(real_from, real_to) == -1)
+		return -errno;
+
+	return 0;
+}
+
 static struct fuse_operations rotfs_ops = {
 	.getattr	= rotfs_getattr,
 	.readdir	= rotfs_readdir,
@@ -325,6 +414,7 @@ static struct fuse_operations rotfs_ops = {
 	.getxattr	= rotfs_getxattr,
 	.listxattr	= rotfs_listxattr,
 	.removexattr	= rotfs_removexattr,
+	.rename		= rotfs_rename,
 };
 
 static int rotfs_opt_proc(void *data, const char *arg, int key,
