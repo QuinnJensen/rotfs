@@ -1,4 +1,4 @@
-# rotfs – Rename‑On‑Truncate versioning filesystem
+# rotfs – Rename‑On‑Truncate versioning FUSE filesystem
 
 `rotfs` is a small FUSE filesystem that adds simple, transparent file
 versioning on top of an existing directory. It behaves like a
@@ -8,6 +8,7 @@ previous contents are preserved as a timestamped sibling file.
 Example:
 
 ```bash
+$ mkdir tback z
 $ ./rotfs --backing=tback z
 $ echo "one"  > z/foo
 $ echo "two"  > z/foo
